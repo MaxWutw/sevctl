@@ -10,10 +10,9 @@ use std::{
     slice::from_raw_parts,
 };
 
-use ::sev::{certs::sev::sev::Certificate, launch::sev, session};
+use ::sev::{certs::sev::sev::Certificate, launch::sev, parser::{Decoder, Encoder}, session};
 
 use anyhow::anyhow;
-use codicon::{Decoder, Encoder};
 
 pub fn cmd(name: Option<String>, pdh: PathBuf, policy: u32) -> super::Result<()> {
     let (tik_fname, tek_fname, godh_fname, session_fname) = file_names(name);
@@ -23,8 +22,8 @@ pub fn cmd(name: Option<String>, pdh: PathBuf, policy: u32) -> super::Result<()>
     let tik = &session.tik;
     let tek = &session.tek;
 
-    let pdh_file = fs::File::open(pdh).context("couldn't open PDH file pointed to by path")?;
-    let pdh = Certificate::decode(pdh_file, ()).unwrap();
+    let mut pdh_file = fs::File::open(pdh).context("couldn't open PDH file pointed to by path")?;
+    let pdh = Certificate::decode(&mut pdh_file, ()).unwrap();
 
     let start = match session.start_pdh(pdh) {
         Ok(s) => s,

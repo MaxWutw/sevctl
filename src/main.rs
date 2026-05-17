@@ -6,6 +6,7 @@ mod measurement;
 mod ok;
 mod secret;
 mod session;
+#[cfg(target_os = "linux")]
 mod validate;
 mod vmsa;
 
@@ -31,7 +32,7 @@ use ::sev::{
 
 use anyhow::{Context, Result};
 use clap::{arg, Parser, Subcommand, ValueEnum};
-use codicon::*;
+use sev::parser::{Decoder, Encoder};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -102,8 +103,8 @@ enum SevctlCmd {
         #[arg(value_name = "pdh", required = true)]
         pdh: PathBuf,
 
-        /// 32-bit integer representing the launch policy
-        #[arg(value_name = "policy", required = true)]
+        /// 32-bit integer representing the launch policy (supports 0x hex prefix)
+        #[arg(value_name = "policy", required = true, value_parser = parse_policy)]
         policy: u32,
     },
 
@@ -129,6 +130,7 @@ enum SevctlCmd {
     },
 
     /// Validate subcommands
+    #[cfg(target_os = "linux")]
     Validate {
         /// Path to the SEV cert chain, can be obtained by the `export` subcommand
         #[arg(value_name = "sev-cert-chain", required = true)]
@@ -171,8 +173,8 @@ async fn download(url: &str, usage: Usage) -> Result<Certificate> {
             }
             Ok(rsp) => match rsp.bytes().await {
                 Ok(body) => {
-                    let out = Cursor::new(body.into_iter().collect::<Vec<u8>>());
-                    return Certificate::decode(out, ())
+                    let mut out = Cursor::new(body.into_iter().collect::<Vec<u8>>());
+                    return Certificate::decode(&mut out, ())
                         .context(format!("failed to decode {} certificate", usage));
                 }
                 Err(e) => return Err(anyhow::Error::new(e).context("failed to read response body")),
@@ -199,10 +201,18 @@ async fn download(url: &str, usage: Usage) -> Result<Certificate> {
 
     match rsp.bytes().await {
         Ok(body) => {
-            let out = Cursor::new(body.into_iter().collect::<Vec<u8>>());
-            Certificate::decode(out, ()).context(format!("failed to decode {} certificate", usage))
+            let mut out = Cursor::new(body.into_iter().collect::<Vec<u8>>());
+            Certificate::decode(&mut out, ()).context(format!("failed to decode {} certificate", usage))
         }
         Err(e) => Err(anyhow::Error::new(e).context("failed to read response body")),
+    }
+}
+
+fn parse_policy(s: &str) -> std::result::Result<u32, String> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0x")) {
+        u32::from_str_radix(hex, 16).map_err(|e| e.to_string())
+    } else {
+        s.parse::<u32>().map_err(|e| e.to_string())
     }
 }
 
@@ -225,14 +235,18 @@ fn chain() -> Result<Chain> {
         .map_err(|e| anyhow::anyhow!(format!("{:?}", e)))
         .context("unable to export SEV certificates")?;
 
-    let id = firmware()?
-        .get_identifier()
-        .map_err(|e| anyhow::anyhow!(format!("{:?}", e)))
-        .context("error fetching identifier")?;
-    let url = format!("{}/{}", CEK_SVC, id);
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    chain.cek = rt.block_on(download(&url, Usage::CEK))?;
+    // Try to download the AMD-signed CEK from KDS. If get_identifier()
+    // is not supported, fall back to the locally-exported CEK from pdh_cert_export().
+    match firmware()?.get_identifier() {
+        Ok(id) => {
+            let url = format!("{}/{}", CEK_SVC, id);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            chain.cek = rt.block_on(download(&url, Usage::CEK))?;
+        }
+        Err(e) => {
+            log::warn!("get_identifier() not available ({:?}), using locally-exported CEK", e);
+        }
+    }
 
     Ok(chain)
 }
@@ -266,6 +280,7 @@ fn main() -> Result<()> {
         SevctlCmd::Session { name, pdh, policy } => session::cmd(name, pdh, policy),
         SevctlCmd::Show { cmd } => show::cmd(cmd),
         SevctlCmd::Verify { sev, oca, ca } => verify::cmd(sevctl.quiet, sev, oca, ca),
+        #[cfg(target_os = "linux")]
         SevctlCmd::Validate {
             chain_path,
             ar_path,
@@ -327,20 +342,27 @@ mod show {
                 println!("{}", id);
             }
             Show::Flags => {
+                let mut any = false;
                 for f in [
                     PlatformStatusFlags::OWNED,
                     PlatformStatusFlags::ENCRYPTED_STATE,
                 ]
                 .iter()
                 {
-                    println!(
-                        "{}",
-                        match status.flags.clone() & f.clone() {
-                            PlatformStatusFlags::ENCRYPTED_STATE => "es",
-                            PlatformStatusFlags::OWNED => "owned",
-                            _ => continue,
+                    match status.flags.clone() & f.clone() {
+                        f if f == PlatformStatusFlags::ENCRYPTED_STATE => {
+                            println!("es");
+                            any = true;
                         }
-                    );
+                        f if f == PlatformStatusFlags::OWNED => {
+                            println!("owned");
+                            any = true;
+                        }
+                        _ => continue,
+                    }
+                }
+                if !any {
+                    println!("(none — platform is self-owned, SEV-ES not enabled)");
                 }
             }
         }
